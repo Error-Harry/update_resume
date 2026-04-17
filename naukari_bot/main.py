@@ -22,7 +22,7 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 TO_EMAIL = os.getenv("TO_EMAIL")
 
 BASE_RESUME = "naukari_bot/Harsh_Nargide.pdf"
-MAX_RETRIES = 1
+MAX_RETRIES = 2
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -139,7 +139,8 @@ async def update_resume_headline(page):
                 .locator("span.edit.icon")
         )
         await edit_icon.wait_for(state="visible", timeout=15000)
-        await edit_icon.click()
+        # Use JS click to bypass interception by any lingering modal overlays (e.g. .ltLayer.open)
+        await edit_icon.evaluate("node => node.click()")
 
         # Wait for the modal / inline editor textarea to appear
         await page.wait_for_selector(TEXTAREA_ID, state="visible", timeout=20000)
@@ -173,7 +174,9 @@ async def update_resume_headline(page):
 
 async def upload_resume_once(resume_path):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        # Run headless in CI (GitHub Actions sets CI=true), headed locally for debugging
+        is_ci = os.getenv("CI", "false").lower() == "true"
+        browser = await p.chromium.launch(headless=is_ci)
         context = await browser.new_context()
         page = await context.new_page()
 
