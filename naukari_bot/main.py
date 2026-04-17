@@ -67,7 +67,7 @@ def send_email(subject, body, attachment_path=None):
             smtp.login(SMTP_EMAIL, SMTP_PASSWORD)
             smtp.send_message(msg)
 
-        logging.info("Email sent successfully")
+        logging.info(f"Email sent successfully: '{subject}'")
 
     except Exception as e:
         logging.error(f"Email failed: {e}")
@@ -77,25 +77,13 @@ def send_email(subject, body, attachment_path=None):
 
 async def login(page):
     await page.goto("https://www.naukri.com/nlogin/login", timeout=60000)
-    await page.wait_for_selector("input[type='password']", timeout=20000)
+    
+    # Wait for the explicit ID used by Naukri, highly reliable and less flaky than input[type=password]
+    await page.wait_for_selector("#usernameField", timeout=30000)
+    await page.wait_for_selector("#passwordField", timeout=30000)
 
-    inputs = await page.query_selector_all("input")
-
-    email_input = None
-    password_input = None
-
-    for i, inp in enumerate(inputs):
-        if await inp.get_attribute("type") == "password":
-            password_input = inp
-            if i > 0:
-                email_input = inputs[i - 1]
-            break
-
-    if not email_input or not password_input:
-        raise Exception("Login inputs not found")
-
-    await email_input.fill(EMAIL)
-    await password_input.fill(PASSWORD)
+    await page.fill("#usernameField", EMAIL)
+    await page.fill("#passwordField", PASSWORD)
 
     await page.click("button[type='submit']")
 
