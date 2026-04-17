@@ -26,9 +26,15 @@ jobs:
       - name: Install Playwright browsers
         run: playwright install chromium --with-deps
 
+      # Naukri often serves no login form to true headless + datacenter IPs. Run headed Chromium
+      # on a virtual display (xvfb) so behavior matches a normal desktop browser.
       - name: Run Naukri update script
-        run: python naukari_bot/main.py
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python naukari_bot/main.py
         env:
+          PLAYWRIGHT_HEADED: "1"
           EMAIL:         ${{ secrets.NAUKRI_EMAIL }}
           PASSWORD:      ${{ secrets.NAUKRI_PASSWORD }}
           SMTP_EMAIL:    ${{ secrets.SMTP_EMAIL }}
