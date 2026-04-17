@@ -22,7 +22,7 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 TO_EMAIL = os.getenv("TO_EMAIL")
 
 BASE_RESUME = "naukari_bot/Harsh_Nargide.pdf"
-MAX_RETRIES = 3
+MAX_RETRIES = 1
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -98,41 +98,78 @@ async def login(page):
     await password_input.fill(PASSWORD)
 
     await page.click("button[type='submit']")
-    await page.wait_for_selector("text=View profile", timeout=20000)
+
+    # URL change to homepage confirms successful login
+    await page.wait_for_url("**/mnjuser/homepage**", timeout=30000)
+    logging.info("Login successful — redirected to homepage")
+
+    await page.wait_for_timeout(2000)   # let any post-login popup render
+
+    # Dismiss any overlay/popup (disability survey, notifications, etc.)
+    # Escape works universally for Naukri modals; safe to call even if nothing is open
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
 
 
 async def update_resume_headline(page):
     logging.info("Updating resume headline...")
 
-    # Step 1: Locate Resume Headline section container
-    section = page.locator("text=Resume headline").first
+    TEXTAREA_ID = "#resumeHeadlineTxt"
+    # Save button: scoped to the form-actions row to avoid matching hidden "Save photo" button
+    # Both the inline form and modal use div.form-actions > div.action > button[type=submit]
+    SAVE_BTN    = ".form-actions button[type='submit']"
 
-    # Step 2: Move up to parent container
-    container = section.locator("xpath=ancestor::div[1]")
+    async def scroll_and_open_editor():
+        """Scroll to the Resume Headline section (triggers lazy load) then click the edit icon."""
+        # Use JS to scroll the lazy container into view
+        await page.evaluate("""
+            const el = document.querySelector('#lazyResumeHead');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        """)
+        await page.wait_for_timeout(2000)   # wait for lazy content to render
 
-    # Step 3: Click inside container (this triggers edit modal)
-    await container.click()
+        # Find the edit (pencil) icon that belongs specifically to the Resume Headline widget
+        edit_icon = (
+            page.locator(".widgetHead")
+                .filter(has_text="Resume headline")
+                .locator("span.edit.icon")
+        )
+        await edit_icon.wait_for(state="visible", timeout=15000)
+        await edit_icon.click()
 
-    # Step 4: Wait for modal textarea (increase timeout)
-    await page.wait_for_selector("textarea", timeout=20000)
+        # Wait for the modal / inline editor textarea to appear
+        await page.wait_for_selector(TEXTAREA_ID, state="visible", timeout=20000)
+        logging.info("Editor opened")
 
-    textarea = page.locator("textarea").first
+    async def save_and_close():
+        """Click Save and wait for the editor/modal to close."""
+        await page.locator(SAVE_BTN).first.click()
+        await page.wait_for_selector(TEXTAREA_ID, state="hidden", timeout=20000)
+        await page.wait_for_timeout(1500)   # let DOM settle
+
+    # ── FIRST EDIT: open, append dot, save ───────────────────────────────────
+    await scroll_and_open_editor()
+
+    textarea = page.locator(TEXTAREA_ID)
     current_text = await textarea.input_value()
+    logging.info(f"Current headline: {current_text!r}")
 
-    # Step 5: Add dot
     await textarea.fill(current_text + ".")
-    await page.locator("button:has-text('Save')").click()
+    await save_and_close()
+    logging.info("First save done (dot added)")
 
-    await page.wait_for_timeout(3000)
+    # ── SECOND EDIT: re-open, restore original, save ──────────────────────────
+    await scroll_and_open_editor()
 
-    # Step 6: Remove dot
-    await page.wait_for_selector("textarea", timeout=20000)
-    textarea = page.locator("textarea").first
-
+    textarea = page.locator(TEXTAREA_ID)
     await textarea.fill(current_text)
-    await page.locator("button:has-text('Save')").click()
+    await save_and_close()
+    logging.info("Second save done — headline update complete ✓")
 
-    logging.info("Headline updated successfully")
 
 async def upload_resume_once(resume_path):
     async with async_playwright() as p:
@@ -153,7 +190,16 @@ async def upload_resume_once(resume_path):
             await page.wait_for_timeout(5000)
             logging.info("Resume uploaded")
 
-            # 🔥 NEW STEP: Update headline
+            # Re-navigate to profile page so it's in a clean state after upload
+            logging.info("Reloading profile page before headline update...")
+            await page.goto("https://www.naukri.com/mnjuser/profile", timeout=60000)
+            # Naukri fires analytics/widget requests endlessly — networkidle never fires.
+            # Use domcontentloaded + wait for a key element instead.
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await page.wait_for_selector("text=Resume headline", timeout=20000)
+            await page.wait_for_timeout(2000)   # brief pause for JS to wire up
+
+            # Update headline
             await update_resume_headline(page)
 
         finally:
