@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shutil
+import sys
 import smtplib
 import logging
 from datetime import datetime
@@ -82,6 +83,7 @@ async def login(page):
         wait_until="domcontentloaded",
         timeout=60000,
     )
+    logging.info("Login page: url=%r title=%r", page.url, await page.title())
 
     # Naukri serves at least two login UIs (SPA vs login.naukri.com legacy). Waiting only for
     # #usernameField times out when the legacy form (#emailTxt / #pwd1) is shown instead.
@@ -173,10 +175,21 @@ async def update_resume_headline(page):
 
 async def upload_resume_once(resume_path):
     async with async_playwright() as p:
-        # Run headless in CI (GitHub Actions sets CI=true), headed locally for debugging
+        # Local: headed (easier on Naukri). CI: true headless is often blocked (no login DOM);
+        # run under Xvfb with PLAYWRIGHT_HEADED=1 (see .github/workflows) so Chromium is headed.
         is_ci = os.getenv("CI", "false").lower() == "true"
-        browser = await p.chromium.launch(headless=is_ci)
-        context = await browser.new_context()
+        headed = os.getenv("PLAYWRIGHT_HEADED", "").lower() in ("1", "true", "yes")
+        headless = is_ci and not headed
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+        ]
+        browser = await p.chromium.launch(headless=headless, args=launch_args)
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+        )
         page = await context.new_page()
 
         try:
@@ -235,6 +248,7 @@ async def upload_with_retry():
         f"Update Failed - {today}",
         f"Resume/Profile update failed after {MAX_RETRIES} attempts."
     )
+    sys.exit(1)
 
 
 if __name__ == "__main__":
