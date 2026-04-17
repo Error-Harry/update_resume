@@ -30,6 +30,51 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 # ================== UTIL ==================
 
+async def dump_debug_artifacts(page, prefix: str):
+    """
+    Best-effort debug dump for CI failures (screenshots + HTML).
+    Safe to call even when the page is mid-navigation.
+    """
+    try:
+        os.makedirs("artifacts", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join("artifacts", f"{prefix}_{ts}")
+        await page.screenshot(path=f"{base}.png", full_page=True)
+        html = await page.content()
+        with open(f"{base}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        with open(f"{base}.txt", "w", encoding="utf-8") as f:
+            f.write(f"url={page.url}\n")
+            try:
+                f.write(f"title={await page.title()}\n")
+            except Exception:
+                pass
+        logging.info("Saved debug artifacts: %s(.png/.html/.txt)", base)
+    except Exception as e:
+        logging.info("Debug artifact dump failed: %s", e)
+
+
+async def wait_for_any(page, *, urls: list[str], selectors: list[str], timeout_ms: int):
+    """
+    Wait until either:
+    - the page URL matches any glob in `urls`, or
+    - any selector in `selectors` is visible
+    """
+    tasks = []
+    for u in urls:
+        tasks.append(asyncio.create_task(page.wait_for_url(u, wait_until="domcontentloaded", timeout=timeout_ms)))
+    for s in selectors:
+        tasks.append(asyncio.create_task(page.locator(s).first.wait_for(state="visible", timeout=timeout_ms)))
+
+    done, pending = await asyncio.wait(tasks, timeout=timeout_ms / 1000, return_when=asyncio.FIRST_COMPLETED)
+    for p in pending:
+        p.cancel()
+    if not done:
+        raise PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded waiting for any of urls={urls} selectors={selectors}")
+    # propagate exceptions if the first completed task failed
+    await list(done)[0]
+
+
 def rename_resume():
     today = datetime.now().strftime("%d_%b_%Y")
     new_file = f"Harsh_Nargide_{today}.pdf"
@@ -100,9 +145,27 @@ async def login(page):
         await page.locator("#pwd1").fill(PASSWORD)
         await page.locator("#sbtLog[name='Login']").first.click()
 
-    # URL change to homepage confirms successful login
-    await page.wait_for_url("**/mnjuser/homepage**", timeout=30000)
-    logging.info("Login successful — redirected to homepage")
+    # Naukri sometimes does not fire the full 'load' event (long-lived requests), so do not wait for it.
+    # Also, the post-login landing URL can vary. Accept any mnjuser page or presence of a logged-in header.
+    try:
+        await wait_for_any(
+            page,
+            urls=[
+                "**/mnjuser/homepage**",
+                "**/mnjuser/profile**",
+                "**/mnjuser/**",
+            ],
+            selectors=[
+                # Logged-in top navigation (best-effort; selector may vary)
+                "a[href*='logout' i]",
+                "a[href*='mnjuser/profile' i]",
+            ],
+            timeout_ms=60000,
+        )
+    except Exception:
+        await dump_debug_artifacts(page, "login_post_submit")
+        raise
+    logging.info("Login successful — redirected (or logged-in UI detected)")
 
     await page.wait_for_timeout(2000)   # let any post-login popup render
 
