@@ -30,6 +30,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 # ================== UTIL ==================
 
+def validate_env():
+    missing = []
+    for name, value in [
+        ("EMAIL", EMAIL),
+        ("PASSWORD", PASSWORD),
+        ("SMTP_EMAIL", SMTP_EMAIL),
+        ("SMTP_PASSWORD", SMTP_PASSWORD),
+        ("SMTP_SERVER", SMTP_SERVER),
+        ("TO_EMAIL", TO_EMAIL),
+    ]:
+        if not value:
+            missing.append(name)
+    if missing:
+        logging.error("Missing required environment variables: %s", ", ".join(missing))
+        logging.error("In GitHub Actions, ensure these repository secrets are set and mapped in the workflow.")
+        sys.exit(2)
+
+
 async def dump_debug_artifacts(page, prefix: str):
     """
     Best-effort debug dump for CI failures (screenshots + HTML).
@@ -315,4 +333,5 @@ async def upload_with_retry():
 
 
 if __name__ == "__main__":
+    validate_env()
     asyncio.run(upload_with_retry())
