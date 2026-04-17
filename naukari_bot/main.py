@@ -76,16 +76,27 @@ def send_email(subject, body, attachment_path=None):
 # ================== CORE ==================
 
 async def login(page):
-    await page.goto("https://www.naukri.com/nlogin/login", timeout=60000)
-    
-    # Wait for the explicit ID used by Naukri, highly reliable and less flaky than input[type=password]
-    await page.wait_for_selector("#usernameField", timeout=30000)
-    await page.wait_for_selector("#passwordField", timeout=30000)
+    # domcontentloaded avoids hanging on long-lived analytics requests (Naukri never reaches "networkidle").
+    await page.goto(
+        "https://www.naukri.com/nlogin/login",
+        wait_until="domcontentloaded",
+        timeout=60000,
+    )
 
-    await page.fill("#usernameField", EMAIL)
-    await page.fill("#passwordField", PASSWORD)
+    # Naukri serves at least two login UIs (SPA vs login.naukri.com legacy). Waiting only for
+    # #usernameField times out when the legacy form (#emailTxt / #pwd1) is shown instead.
+    user = page.locator("#usernameField, #emailTxt, input[name='USERNAME']").first
+    await user.wait_for(state="visible", timeout=45000)
 
-    await page.click("button[type='submit']")
+    pwd_new = page.locator("#passwordField")
+    if await pwd_new.is_visible():
+        await page.locator("#usernameField").fill(EMAIL)
+        await pwd_new.fill(PASSWORD)
+        await page.locator("button[type='submit']").first.click()
+    else:
+        await page.locator("#emailTxt, input[name='USERNAME']").first.fill(EMAIL)
+        await page.locator("#pwd1").fill(PASSWORD)
+        await page.locator("#sbtLog[name='Login']").first.click()
 
     # URL change to homepage confirms successful login
     await page.wait_for_url("**/mnjuser/homepage**", timeout=30000)
