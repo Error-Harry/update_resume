@@ -25,6 +25,10 @@ TO_EMAIL = os.getenv("TO_EMAIL")
 BASE_RESUME = "naukari_bot/Harsh_Nargide.pdf"
 MAX_RETRIES = 2
 
+# Playwright stores cookies/session under this directory when not in CI (override with NAUKRI_USER_DATA_DIR).
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_USER_DATA_DIR = os.path.join(_SCRIPT_DIR, ".pw-profile")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
@@ -91,6 +95,19 @@ async def wait_for_any(page, *, urls: list[str], selectors: list[str], timeout_m
         raise PlaywrightTimeoutError(f"Timeout {timeout_ms}ms exceeded waiting for any of urls={urls} selectors={selectors}")
     # propagate exceptions if the first completed task failed
     await list(done)[0]
+
+
+def resolve_user_data_dir() -> str | None:
+    """
+    Persistent Chromium profile path. None = fresh session every run (typical CI).
+    Local default reuses naukari_bot/.pw-profile so Naukri stays logged in between days.
+    """
+    explicit = os.getenv("NAUKRI_USER_DATA_DIR", "").strip()
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    if os.getenv("CI", "false").lower() == "true":
+        return None
+    return _DEFAULT_USER_DATA_DIR
 
 
 def rename_resume():
@@ -196,6 +213,34 @@ async def login(page):
         pass
 
 
+async def _session_valid_on_profile(page) -> bool:
+    """After navigating to /mnjuser/profile, detect whether we are logged in."""
+    if "nlogin" in page.url.lower():
+        return False
+    try:
+        await page.wait_for_selector("text=Resume", timeout=15000)
+        return True
+    except PlaywrightTimeoutError:
+        return False
+
+
+async def ensure_logged_in(page):
+    """
+    Reuse cookies from a persistent user-data dir when possible; only run password login if needed.
+    """
+    await page.goto(
+        "https://www.naukri.com/mnjuser/profile",
+        wait_until="domcontentloaded",
+        timeout=60000,
+    )
+    if await _session_valid_on_profile(page):
+        logging.info("Existing Naukri session is still valid — skipping credential login.")
+        return
+    logging.info("No usable session — performing login.")
+    await login(page)
+    await page.goto("https://www.naukri.com/mnjuser/profile", timeout=60000)
+    await page.wait_for_selector("text=Resume", timeout=20000)
+
 
 async def update_resume_headline(page):
     logging.info("Updating resume headline...")
@@ -265,19 +310,33 @@ async def upload_resume_once(resume_path):
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
         ]
-        browser = await p.chromium.launch(headless=headless, args=launch_args)
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
-        page = await context.new_page()
+        user_data_dir = resolve_user_data_dir()
+        browser = None
+        if user_data_dir:
+            os.makedirs(user_data_dir, exist_ok=True)
+            logging.info("Using persistent browser profile at %s", user_data_dir)
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=headless,
+                viewport={"width": 1280, "height": 720},
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+                args=launch_args,
+            )
+            page = context.pages[0] if context.pages else await context.new_page()
+        else:
+            if is_ci:
+                logging.info("Ephemeral browser (CI) — no saved session; logging in each run.")
+            browser = await p.chromium.launch(headless=headless, args=launch_args)
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+            )
+            page = await context.new_page()
 
         try:
-            await login(page)
-
-            await page.goto("https://www.naukri.com/mnjuser/profile", timeout=60000)
-            await page.wait_for_selector("text=Resume", timeout=20000)
+            await ensure_logged_in(page)
 
             # Upload resume
             await page.click("text=Update resume")
@@ -299,7 +358,10 @@ async def upload_resume_once(resume_path):
             await update_resume_headline(page)
 
         finally:
-            await browser.close()
+            if browser:
+                await browser.close()
+            else:
+                await context.close()
 
 
 async def upload_with_retry():
