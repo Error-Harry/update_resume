@@ -276,6 +276,17 @@ async def ensure_logged_in(page):
     try:
         await page.wait_for_selector("text=/My Jobs|Services|Job Alerts|Resume/i", timeout=10000)
         logging.info("Existing Shine session is still valid — skipping credential login.")
+        
+        # Verify session works for profile page too
+        await page.goto("https://www.shine.com/myshine/myprofile/", timeout=60000)
+        await page.wait_for_timeout(2000)
+        
+        # Check if we got redirected to login
+        if "login" in page.url.lower():
+            logging.info("Session valid for dashboard but not profile — performing login.")
+            await login(page)
+        else:
+            logging.info("Session valid for profile page")
         return
     except Exception:
         # Session not valid, need to login
@@ -358,30 +369,93 @@ async def upload_resume_once(resume_path):
             logging.info("Navigating to profile page for resume upload...")
             await page.goto("https://www.shine.com/myshine/myprofile/", timeout=60000)
             await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)  # Wait for dynamic content to load
+
+            # Check if we got redirected to login page
+            if "login" in page.url.lower():
+                logging.error("Got redirected to login page. Session might have expired.")
+                raise Exception("Session expired while accessing profile page")
+
+            # Scroll to resume section to trigger any lazy loading
+            await page.evaluate("""
+                const resumeSection = document.querySelector('[class*="resume" i], [id*="resume" i]');
+                if (resumeSection) {
+                    resumeSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            """)
             await page.wait_for_timeout(2000)
 
-            # Look for the Upload button in the Resume section
-            upload_button = page.locator("button:has-text('Upload'), a:has-text('Upload')").first
+            # Try multiple strategies to find and trigger the file upload
+            upload_success = False
             
+            # Strategy 1: Look for Upload button or link
             try:
-                await upload_button.wait_for(state="visible", timeout=10000)
-                await upload_button.click()
-                logging.info("Upload button clicked")
-                await page.wait_for_timeout(1000)
+                upload_trigger = page.locator("button:has-text('Upload'), a:has-text('Upload'), span:has-text('Upload')").first
+                await upload_trigger.wait_for(state="visible", timeout=10000)
+                await upload_trigger.click()
+                logging.info("Upload trigger clicked")
+                await page.wait_for_timeout(2000)
+                upload_success = True
             except Exception as e:
-                logging.warning(f"Could not find upload button, trying file input directly: {e}")
+                logging.warning(f"Strategy 1 failed: {e}")
 
-            # Set the file input
-            file_input = page.locator("input[type='file']").first
-            await file_input.set_input_files(resume_path)
-            logging.info("Resume file selected")
+            # Strategy 2: Look for file input directly (might be hidden)
+            try:
+                file_input = page.locator("input[type='file']").first
+                
+                # Check if file input exists
+                if await file_input.count() > 0:
+                    # Make the file input visible if it's hidden
+                    await page.evaluate("""
+                        const fileInputs = document.querySelectorAll('input[type="file"]');
+                        fileInputs.forEach(input => {
+                            input.style.display = 'block';
+                            input.style.visibility = 'visible';
+                            input.style.opacity = '1';
+                            input.style.position = 'relative';
+                        });
+                    """)
+                    await page.wait_for_timeout(500)
+                    
+                    await file_input.set_input_files(resume_path)
+                    logging.info("Resume file selected via file input")
+                    upload_success = True
+                else:
+                    logging.error("No file input found on the page")
+            except Exception as e:
+                logging.error(f"Strategy 2 failed: {e}")
+
+            if not upload_success:
+                # Strategy 3: Try to find edit/update button in resume section
+                try:
+                    edit_buttons = page.locator("button:has-text('Edit'), a:has-text('Edit'), span.edit, i.edit").all()
+                    for btn in await edit_buttons:
+                        try:
+                            await btn.click()
+                            await page.wait_for_timeout(2000)
+                            
+                            # Now try file input again
+                            file_input = page.locator("input[type='file']").first
+                            await file_input.set_input_files(resume_path)
+                            logging.info("Resume file selected after clicking edit")
+                            upload_success = True
+                            break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logging.error(f"Strategy 3 failed: {e}")
+
+            if not upload_success:
+                # Dump debug info to understand page structure
+                await dump_debug_artifacts(page, "profile_page_no_upload")
+                raise Exception("Could not find any way to upload resume on the profile page")
 
             # Wait for upload to complete
             await page.wait_for_timeout(5000)
             
             # Look for success message or confirmation
             try:
-                await page.wait_for_selector("text=/uploaded|success|updated/i", timeout=10000)
+                await page.wait_for_selector("text=/uploaded|success|updated|saved/i", timeout=10000)
                 logging.info("Resume upload confirmed")
             except Exception:
                 logging.info("Resume uploaded (no explicit confirmation found)")
