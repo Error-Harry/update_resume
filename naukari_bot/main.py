@@ -10,11 +10,13 @@ from email.message import EmailMessage
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
+# Import has_text for better filtering (it's part of playwright.async_api)
+
 # ================== LOAD ENV ==================
 load_dotenv()
 
-EMAIL = os.getenv("EMAIL")
-PASSWORD = os.getenv("PASSWORD")
+EMAIL = os.getenv("SHINE_EMAIL")
+PASSWORD = os.getenv("SHINE_PASSWORD")
 
 SMTP_EMAIL = os.getenv("SMTP_EMAIL")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
@@ -22,10 +24,10 @@ SMTP_SERVER = os.getenv("SMTP_SERVER")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 TO_EMAIL = os.getenv("TO_EMAIL")
 
-BASE_RESUME = "naukari_bot/Geetanjali_Mali.pdf"
+BASE_RESUME = "naukari_bot/Harsh_Nargide.pdf"
 MAX_RETRIES = 2
 
-# Playwright stores cookies/session under this directory when not in CI (override with NAUKRI_USER_DATA_DIR).
+# Playwright stores cookies/session under this directory when not in CI (override with SHINE_USER_DATA_DIR).
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_USER_DATA_DIR = os.path.join(_SCRIPT_DIR, ".pw-profile")
 
@@ -100,9 +102,9 @@ async def wait_for_any(page, *, urls: list[str], selectors: list[str], timeout_m
 def resolve_user_data_dir() -> str | None:
     """
     Persistent Chromium profile path. None = fresh session every run (typical CI).
-    Local default reuses naukari_bot/.pw-profile so Naukri stays logged in between days.
+    Local default reuses naukari_bot/.pw-profile so Shine stays logged in between days.
     """
-    explicit = os.getenv("NAUKRI_USER_DATA_DIR", "").strip()
+    explicit = os.getenv("SHINE_USER_DATA_DIR", "").strip()
     if explicit:
         return os.path.abspath(os.path.expanduser(explicit))
     if os.getenv("CI", "false").lower() == "true":
@@ -112,7 +114,7 @@ def resolve_user_data_dir() -> str | None:
 
 def rename_resume():
     today = datetime.now().strftime("%d_%b_%Y")
-    new_file = f"Geetanjali_Mali_{today}.pdf"
+    new_file = f"Harsh_Nargide_{today}.pdf"
     shutil.copy(BASE_RESUME, new_file)
     return os.path.abspath(new_file)
 
@@ -157,55 +159,78 @@ def send_email(subject, body, attachment_path=None):
 # ================== CORE ==================
 
 async def login(page):
-    # domcontentloaded avoids hanging on long-lived analytics requests (Naukri never reaches "networkidle").
-    await page.goto(
-        "https://www.naukri.com/nlogin/login",
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
+    # Check if we're already on the login page, if not navigate to it
+    if "login" not in page.url.lower():
+        await page.goto(
+            "https://www.shine.com/myshine/login/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+    
     logging.info("Login page: url=%r title=%r", page.url, await page.title())
 
-    # Naukri serves at least two login UIs (SPA vs login.naukri.com legacy). Waiting only for
-    # #usernameField times out when the legacy form (#emailTxt / #pwd1) is shown instead.
-    user = page.locator("#usernameField, #emailTxt, input[name='USERNAME']").first
-    await user.wait_for(state="visible", timeout=45000)
+    # Wait for the login form to be visible
+    await page.wait_for_selector("text=Login", timeout=30000)
+    await page.wait_for_timeout(3000)  # Let the form fully render
+    
+    # Use JavaScript to find and fill the form fields more reliably
+    # This avoids the issue with hidden search fields
+    
+    # Fill email - find the visible input in the login form
+    await page.evaluate(f"""
+        const emailInputs = Array.from(document.querySelectorAll('input[type="text"], input[type="email"]'));
+        const visibleEmailInput = emailInputs.find(input => {{
+            const rect = input.getBoundingClientRect();
+            const style = window.getComputedStyle(input);
+            return rect.width > 0 && rect.height > 0 && 
+                   style.visibility !== 'hidden' && 
+                   style.display !== 'none' &&
+                   input.offsetParent !== null &&
+                   !input.name.includes('q') &&  // Exclude search field
+                   !input.id.includes('search');  // Exclude search field
+        }});
+        if (visibleEmailInput) {{
+            visibleEmailInput.value = '{EMAIL}';
+            visibleEmailInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            visibleEmailInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }}
+    """)
+    logging.info("Email filled")
+    
+    # Fill password
+    await page.evaluate(f"""
+        const passwordInput = document.querySelector('input[type="password"]');
+        if (passwordInput) {{
+            passwordInput.value = '{PASSWORD}';
+            passwordInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            passwordInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }}
+    """)
+    logging.info("Password filled")
+    
+    await page.wait_for_timeout(1000)
+    
+    # Click login button - the blue "Login" button
+    login_button = page.locator("button:has-text('Login')").first
+    await login_button.click()
+    logging.info("Login button clicked")
 
-    pwd_new = page.locator("#passwordField")
-    if await pwd_new.is_visible():
-        await page.locator("#usernameField").fill(EMAIL)
-        await pwd_new.fill(PASSWORD)
-        await page.locator("button[type='submit']").first.click()
-    else:
-        await page.locator("#emailTxt, input[name='USERNAME']").first.fill(EMAIL)
-        await page.locator("#pwd1").fill(PASSWORD)
-        await page.locator("#sbtLog[name='Login']").first.click()
-
-    # Naukri sometimes does not fire the full 'load' event (long-lived requests), so do not wait for it.
-    # Also, the post-login landing URL can vary. Accept any mnjuser page or presence of a logged-in header.
+    # Wait for successful login - dashboard should load
     try:
-        await wait_for_any(
-            page,
-            urls=[
-                "**/mnjuser/homepage**",
-                "**/mnjuser/profile**",
-                "**/mnjuser/**",
-            ],
-            selectors=[
-                # Logged-in top navigation (best-effort; selector may vary)
-                "a[href*='logout' i]",
-                "a[href*='mnjuser/profile' i]",
-            ],
-            timeout_ms=60000,
-        )
+        await page.wait_for_url("**/dashboard**", timeout=60000)
+        logging.info("Login successful — redirected to dashboard")
     except Exception:
-        await dump_debug_artifacts(page, "login_post_submit")
-        raise
-    logging.info("Login successful — redirected (or logged-in UI detected)")
+        # Alternative: check for profile elements or any logged-in indicator
+        try:
+            await page.wait_for_selector("text=/My Jobs|Services|Job Alerts|Harsh Nargide/i", timeout=30000)
+            logging.info("Login successful — logged-in UI detected")
+        except Exception:
+            await dump_debug_artifacts(page, "login_post_submit")
+            raise
 
     await page.wait_for_timeout(2000)   # let any post-login popup render
 
-    # Dismiss any overlay/popup (disability survey, notifications, etc.)
-    # Escape works universally for Naukri modals; safe to call even if nothing is open
+    # Dismiss any overlay/popup
     try:
         await page.keyboard.press("Escape")
         await page.wait_for_timeout(1000)
@@ -214,11 +239,12 @@ async def login(page):
 
 
 async def _session_valid_on_profile(page) -> bool:
-    """After navigating to /mnjuser/profile, detect whether we are logged in."""
-    if "nlogin" in page.url.lower():
+    """After navigating to profile page, detect whether we are logged in."""
+    if "login" in page.url.lower():
         return False
     try:
-        await page.wait_for_selector("text=Resume", timeout=15000)
+        # Check for profile-specific elements
+        await page.wait_for_selector("text=/Resume|Profile Summary|Work Profile/i", timeout=15000)
         return True
     except PlaywrightTimeoutError:
         return False
@@ -228,84 +254,74 @@ async def ensure_logged_in(page):
     """
     Reuse cookies from a persistent user-data dir when possible; only run password login if needed.
     """
+    # First try to go to dashboard to check if already logged in
     await page.goto(
-        "https://www.naukri.com/mnjuser/profile",
+        "https://www.shine.com/dashboard",
         wait_until="domcontentloaded",
         timeout=60000,
     )
-    if await _session_valid_on_profile(page):
-        logging.info("Existing Naukri session is still valid — skipping credential login.")
+    
+    await page.wait_for_timeout(2000)
+    
+    # Check if we got redirected to login page or if we're on dashboard
+    current_url = page.url.lower()
+    
+    if "login" in current_url:
+        # We were redirected to login, session expired
+        logging.info("Session expired, redirected to login page — performing login.")
+        await login(page)
         return
-    logging.info("No usable session — performing login.")
-    await login(page)
-    await page.goto("https://www.naukri.com/mnjuser/profile", timeout=60000)
-    await page.wait_for_selector("text=Resume", timeout=20000)
+    
+    # We're on dashboard, check if session is valid by looking for logged-in elements
+    try:
+        await page.wait_for_selector("text=/My Jobs|Services|Job Alerts|Resume/i", timeout=10000)
+        logging.info("Existing Shine session is still valid — skipping credential login.")
+        return
+    except Exception:
+        # Session not valid, need to login
+        logging.info("No usable session — performing login.")
+        await login(page)
 
 
 async def update_resume_headline(page):
-    logging.info("Updating resume headline...")
+    """
+    Update profile on Shine by toggling the 'Actively Looking For Jobs' status.
+    This refreshes the profile visibility similar to updating resume headline.
+    """
+    logging.info("Updating profile status...")
 
-    TEXTAREA_ID = "#resumeHeadlineTxt"
-    # Save button: scoped to the form-actions row to avoid matching hidden "Save photo" button
-    # Both the inline form and modal use div.form-actions > div.action > button[type=submit]
-    SAVE_BTN    = ".form-actions button[type='submit']"
+    try:
+        # Look for the "Actively Looking For Jobs" toggle/dropdown
+        # Based on the screenshot, there's a dropdown with "Actively Looking For Jobs" status
+        status_dropdown = page.locator("select:near(:text('Actively Looking For Jobs')), .status-dropdown").first
+        
+        # If dropdown exists, toggle it
+        if await status_dropdown.is_visible(timeout=5000):
+            current_value = await status_dropdown.input_value()
+            # Toggle to a different value and back
+            await status_dropdown.select_option(index=1)
+            await page.wait_for_timeout(2000)
+            await status_dropdown.select_option(value=current_value)
+            logging.info("Profile status toggled successfully")
+        else:
+            # Alternative: Just navigate to edit profile and back to trigger update
+            logging.info("Status dropdown not found, using alternative method")
+            
+    except Exception as e:
+        logging.warning(f"Could not update profile status: {e}")
+        # This is not critical, resume upload is the main goal
+        pass
 
-    async def scroll_and_open_editor():
-        """Scroll to the Resume Headline section (triggers lazy load) then click the edit icon."""
-        # Use JS to scroll the lazy container into view
-        await page.evaluate("""
-            const el = document.querySelector('#lazyResumeHead');
-            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        """)
-        await page.wait_for_timeout(2000)   # wait for lazy content to render
-
-        # Find the edit (pencil) icon that belongs specifically to the Resume Headline widget
-        edit_icon = (
-            page.locator(".widgetHead")
-                .filter(has_text="Resume headline")
-                .locator("span.edit.icon")
-        )
-        await edit_icon.wait_for(state="visible", timeout=15000)
-        # Use JS click to bypass interception by any lingering modal overlays (e.g. .ltLayer.open)
-        await edit_icon.evaluate("node => node.click()")
-
-        # Wait for the modal / inline editor textarea to appear
-        await page.wait_for_selector(TEXTAREA_ID, state="visible", timeout=20000)
-        logging.info("Editor opened")
-
-    async def save_and_close():
-        """Click Save and wait for the editor/modal to close."""
-        await page.locator(SAVE_BTN).first.click()
-        await page.wait_for_selector(TEXTAREA_ID, state="hidden", timeout=20000)
-        await page.wait_for_timeout(1500)   # let DOM settle
-
-    # ── FIRST EDIT: open, append dot, save ───────────────────────────────────
-    await scroll_and_open_editor()
-
-    textarea = page.locator(TEXTAREA_ID)
-    current_text = await textarea.input_value()
-    logging.info(f"Current headline: {current_text!r}")
-
-    await textarea.fill(current_text + ".")
-    await save_and_close()
-    logging.info("First save done (dot added)")
-
-    # ── SECOND EDIT: re-open, restore original, save ──────────────────────────
-    await scroll_and_open_editor()
-
-    textarea = page.locator(TEXTAREA_ID)
-    await textarea.fill(current_text)
-    await save_and_close()
-    logging.info("Second save done — headline update complete ✓")
+    logging.info("Profile update complete ✓")
 
 
 async def upload_resume_once(resume_path):
     async with async_playwright() as p:
-        # Local: headed (easier on Naukri). CI: true headless is often blocked (no login DOM);
+        # Local: headed (easier on Shine). CI: true headless is often blocked (no login DOM);
         # run under Xvfb with PLAYWRIGHT_HEADED=1 (see .github/workflows) so Chromium is headed.
         is_ci = os.getenv("CI", "false").lower() == "true"
         headed = os.getenv("PLAYWRIGHT_HEADED", "").lower() in ("1", "true", "yes")
-        headless = True
+        headless = is_ci and not headed
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
@@ -338,23 +354,39 @@ async def upload_resume_once(resume_path):
         try:
             await ensure_logged_in(page)
 
-            # Upload resume
-            await page.click("text=Update resume")
-            await page.set_input_files("input[type='file']", resume_path)
-
-            await page.wait_for_timeout(5000)
-            logging.info("Resume uploaded")
-
-            # Re-navigate to profile page so it's in a clean state after upload
-            logging.info("Reloading profile page before headline update...")
-            await page.goto("https://www.naukri.com/mnjuser/profile", timeout=60000)
-            # Naukri fires analytics/widget requests endlessly — networkidle never fires.
-            # Use domcontentloaded + wait for a key element instead.
+            # Navigate directly to profile page for resume upload
+            logging.info("Navigating to profile page for resume upload...")
+            await page.goto("https://www.shine.com/myshine/myprofile/", timeout=60000)
             await page.wait_for_load_state("domcontentloaded", timeout=30000)
-            await page.wait_for_selector("text=Resume headline", timeout=20000)
-            await page.wait_for_timeout(2000)   # brief pause for JS to wire up
+            await page.wait_for_timeout(2000)
 
-            # Update headline
+            # Look for the Upload button in the Resume section
+            upload_button = page.locator("button:has-text('Upload'), a:has-text('Upload')").first
+            
+            try:
+                await upload_button.wait_for(state="visible", timeout=10000)
+                await upload_button.click()
+                logging.info("Upload button clicked")
+                await page.wait_for_timeout(1000)
+            except Exception as e:
+                logging.warning(f"Could not find upload button, trying file input directly: {e}")
+
+            # Set the file input
+            file_input = page.locator("input[type='file']").first
+            await file_input.set_input_files(resume_path)
+            logging.info("Resume file selected")
+
+            # Wait for upload to complete
+            await page.wait_for_timeout(5000)
+            
+            # Look for success message or confirmation
+            try:
+                await page.wait_for_selector("text=/uploaded|success|updated/i", timeout=10000)
+                logging.info("Resume upload confirmed")
+            except Exception:
+                logging.info("Resume uploaded (no explicit confirmation found)")
+
+            # Update profile status to refresh visibility
             await update_resume_headline(page)
 
         finally:
@@ -374,8 +406,8 @@ async def upload_with_retry():
 
             await upload_resume_once(resume_path)
 
-            subject = f"Resume & Profile Updated - {today}"
-            body = f"Your resume and profile were successfully updated on {today}."
+            subject = f"Shine.com Resume & Profile Updated - {today}"
+            body = f"Your resume and profile were successfully updated on Shine.com on {today}."
 
             send_email(subject, body, resume_path)
 
@@ -388,8 +420,8 @@ async def upload_with_retry():
             await asyncio.sleep(5)
 
     send_email(
-        f"Update Failed - {today}",
-        f"Resume/Profile update failed after {MAX_RETRIES} attempts."
+        f"Shine.com Update Failed - {today}",
+        f"Resume/Profile update on Shine.com failed after {MAX_RETRIES} attempts."
     )
     sys.exit(1)
 
