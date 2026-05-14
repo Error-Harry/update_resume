@@ -22,7 +22,7 @@ SMTP_SERVER = os.getenv("SMTP_SERVER")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 TO_EMAIL = os.getenv("TO_EMAIL")
 
-BASE_RESUME = "naukari_bot/Harsh_Nargide.pdf"
+BASE_RESUME = "naukari_bot/Geetanjali_Mali.pdf"
 MAX_RETRIES = 2
 
 # Playwright stores cookies/session under this directory when not in CI (override with NAUKRI_USER_DATA_DIR).
@@ -112,7 +112,7 @@ def resolve_user_data_dir() -> str | None:
 
 def rename_resume():
     today = datetime.now().strftime("%d_%b_%Y")
-    new_file = f"Harsh_Nargide_{today}.pdf"
+    new_file = f"Geetanjali_Mali_{today}.pdf"
     shutil.copy(BASE_RESUME, new_file)
     return os.path.abspath(new_file)
 
@@ -305,7 +305,7 @@ async def upload_resume_once(resume_path):
         # run under Xvfb with PLAYWRIGHT_HEADED=1 (see .github/workflows) so Chromium is headed.
         is_ci = os.getenv("CI", "false").lower() == "true"
         headed = os.getenv("PLAYWRIGHT_HEADED", "").lower() in ("1", "true", "yes")
-        headless = is_ci and not headed
+        headless = True
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-dev-shm-usage",
