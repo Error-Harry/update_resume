@@ -242,60 +242,160 @@ async def ensure_logged_in(page):
     await page.wait_for_selector("text=Resume", timeout=20000)
 
 
+async def dismiss_overlays(page):
+    """Close Naukri modals/toasts that can block profile edits."""
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(500)
+        for sel in (
+            ".ltLayer.open .crossIcon",
+            ".ltLayer.open [class*='close']",
+            "button[aria-label='Close']",
+        ):
+            btn = page.locator(sel).first
+            if await btn.is_visible():
+                await btn.click()
+                await page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
+async def wait_for_first_visible(page, selectors: list[str], *, timeout_ms: int) -> str:
+    """Return the first selector that becomes visible within timeout_ms."""
+    per_selector_ms = max(timeout_ms // len(selectors), 3000)
+    last_err = None
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="visible", timeout=per_selector_ms)
+            return sel
+        except Exception as e:
+            last_err = e
+    raise PlaywrightTimeoutError(
+        f"None of {selectors} became visible within ~{timeout_ms}ms (last error: {last_err})"
+    )
+
+
+async def click_first_visible(page, selectors: list[str], *, timeout_ms: int) -> str:
+    """Click the first visible locator from candidates; fall back to force/JS click."""
+    sel = await wait_for_first_visible(page, selectors, timeout_ms=timeout_ms)
+    loc = page.locator(sel).first
+    for click_fn in (
+        lambda: loc.click(timeout=5000),
+        lambda: loc.click(force=True, timeout=5000),
+        lambda: loc.evaluate("node => node.click()"),
+    ):
+        try:
+            await click_fn()
+            return sel
+        except Exception:
+            continue
+    raise PlaywrightTimeoutError(f"Could not click visible element: {sel}")
+
+
+HEADLINE_EDIT_SELECTORS = [
+    # Pencil after the Naukri 360 crown icon (crown is the first sibling span).
+    "xpath=//div[contains(@class,'widgetHead')][.//span[normalize-space()='Resume headline']]/span[contains(@class,'edit')]",
+    "#lazyResumeHead .widgetHead:has-text('Resume headline') span.edit.icon",
+    "#lazyResumeHead .widgetHead:has-text('Resume headline') span.edit",
+    "xpath=//div[contains(@class,'widgetHead')][.//span[contains(.,'Resume headline')]]/span[last()]",
+    ".widgetHead:has-text('Resume headline') span.edit.icon",
+]
+
+HEADLINE_TEXTAREA_SELECTORS = [
+    "#resumeHeadlineTxt",
+    "#lazyResumeHead textarea",
+    "textarea[name*='headline' i]",
+    "textarea[id*='headline' i]",
+]
+
+HEADLINE_SAVE_SELECTORS = [
+    ".form-actions button[type='submit']",
+    "#lazyResumeHead button[type='submit']:has-text('Save')",
+    "button.btn-dark-ot[type='submit']:has-text('Save')",
+    "button:has-text('Save')",
+]
+
+
 async def update_resume_headline(page):
     logging.info("Updating resume headline...")
 
-    TEXTAREA_ID = "#resumeHeadlineTxt"
-    # Save button: scoped to the form-actions row to avoid matching hidden "Save photo" button
-    # Both the inline form and modal use div.form-actions > div.action > button[type=submit]
-    SAVE_BTN    = ".form-actions button[type='submit']"
+    async def scroll_to_headline_section():
+        """Bring the Resume headline widget into view and wait for lazy content."""
+        await dismiss_overlays(page)
 
-    async def scroll_and_open_editor():
-        """Scroll to the Resume Headline section (triggers lazy load) then click the edit icon."""
-        # Use JS to scroll the lazy container into view
+        # Quick-link jump is the most reliable way to scroll the profile sidebar section.
+        quick_link = page.locator("a, button, [role='link']").filter(has_text="Resume headline").first
+        if await quick_link.count() > 0 and await quick_link.is_visible():
+            try:
+                await quick_link.click(timeout=5000)
+                await page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
         await page.evaluate("""
-            const el = document.querySelector('#lazyResumeHead');
-            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            () => {
+                const targets = [
+                    document.querySelector('#lazyResumeHead'),
+                    ...document.querySelectorAll('.widgetHead'),
+                ].filter(Boolean);
+                for (const el of targets) {
+                    if (el.textContent && el.textContent.includes('Resume headline')) {
+                        el.scrollIntoView({ block: 'center' });
+                        return;
+                    }
+                }
+                const label = [...document.querySelectorAll('span, div, h2, h3')]
+                    .find(n => n.textContent && n.textContent.trim() === 'Resume headline');
+                label?.scrollIntoView({ block: 'center' });
+            }
         """)
-        await page.wait_for_timeout(2000)   # wait for lazy content to render
+        await page.wait_for_selector("text=Resume headline", timeout=15000)
+        await page.wait_for_timeout(2000)
 
-        # Find the edit (pencil) icon that belongs specifically to the Resume Headline widget
-        edit_icon = (
-            page.locator(".widgetHead")
-                .filter(has_text="Resume headline")
-                .locator("span.edit.icon")
+    async def scroll_and_open_editor() -> str:
+        """Scroll to the Resume Headline section then click the edit (pencil) icon."""
+        await scroll_to_headline_section()
+        await dismiss_overlays(page)
+
+        used_edit = await click_first_visible(page, HEADLINE_EDIT_SELECTORS, timeout_ms=20000)
+        logging.info("Clicked headline edit control via %s", used_edit)
+        await page.wait_for_timeout(1000)
+
+        used_textarea = await wait_for_first_visible(
+            page, HEADLINE_TEXTAREA_SELECTORS, timeout_ms=20000
         )
-        await edit_icon.wait_for(state="visible", timeout=15000)
-        # Use JS click to bypass interception by any lingering modal overlays (e.g. .ltLayer.open)
-        await edit_icon.evaluate("node => node.click()")
+        logging.info("Editor opened (%s)", used_textarea)
+        return used_textarea
 
-        # Wait for the modal / inline editor textarea to appear
-        await page.wait_for_selector(TEXTAREA_ID, state="visible", timeout=20000)
-        logging.info("Editor opened")
-
-    async def save_and_close():
+    async def save_and_close(textarea_selector: str):
         """Click Save and wait for the editor/modal to close."""
-        await page.locator(SAVE_BTN).first.click()
-        await page.wait_for_selector(TEXTAREA_ID, state="hidden", timeout=20000)
-        await page.wait_for_timeout(1500)   # let DOM settle
+        await click_first_visible(page, HEADLINE_SAVE_SELECTORS, timeout_ms=15000)
+        try:
+            await page.locator(textarea_selector).first.wait_for(state="hidden", timeout=20000)
+        except PlaywrightTimeoutError:
+            await dismiss_overlays(page)
+        await page.wait_for_timeout(1500)
 
     # ── FIRST EDIT: open, append dot, save ───────────────────────────────────
-    await scroll_and_open_editor()
+    textarea_selector = await scroll_and_open_editor()
 
-    textarea = page.locator(TEXTAREA_ID)
+    textarea = page.locator(textarea_selector).first
     current_text = await textarea.input_value()
-    logging.info(f"Current headline: {current_text!r}")
+    if not current_text.strip():
+        current_text = (await textarea.text_content() or "").strip()
+    logging.info("Current headline: %r", current_text)
 
     await textarea.fill(current_text + ".")
-    await save_and_close()
+    await save_and_close(textarea_selector)
     logging.info("First save done (dot added)")
 
     # ── SECOND EDIT: re-open, restore original, save ──────────────────────────
     await scroll_and_open_editor()
 
-    textarea = page.locator(TEXTAREA_ID)
+    textarea = page.locator(textarea_selector).first
     await textarea.fill(current_text)
-    await save_and_close()
+    await save_and_close(textarea_selector)
     logging.info("Second save done — headline update complete ✓")
 
 
@@ -318,7 +418,7 @@ async def upload_resume_once(resume_path):
             context = await p.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=headless,
-                viewport={"width": 1280, "height": 720},
+                viewport={"width": 1920, "height": 1080},
                 locale="en-IN",
                 timezone_id="Asia/Kolkata",
                 args=launch_args,
@@ -329,7 +429,7 @@ async def upload_resume_once(resume_path):
                 logging.info("Ephemeral browser (CI) — no saved session; logging in each run.")
             browser = await p.chromium.launch(headless=headless, args=launch_args)
             context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
+                viewport={"width": 1920, "height": 1080},
                 locale="en-IN",
                 timezone_id="Asia/Kolkata",
             )
@@ -352,10 +452,15 @@ async def upload_resume_once(resume_path):
             # Use domcontentloaded + wait for a key element instead.
             await page.wait_for_load_state("domcontentloaded", timeout=30000)
             await page.wait_for_selector("text=Resume headline", timeout=20000)
+            await dismiss_overlays(page)
             await page.wait_for_timeout(2000)   # brief pause for JS to wire up
 
             # Update headline
             await update_resume_headline(page)
+
+        except Exception:
+            await dump_debug_artifacts(page, "upload_resume_once")
+            raise
 
         finally:
             if browser:
