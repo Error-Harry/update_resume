@@ -156,6 +156,60 @@ def send_email(subject, body, attachment_path=None):
 
 # ================== CORE ==================
 
+LOGGED_IN_URL_GLOBS = [
+    "**/mnjuser/homepage**",
+    "**/mnjuser/profile**",
+    "**/mnjuser/**",
+]
+
+LOGGED_IN_SELECTORS = [
+    "a[href*='logout' i]",
+    "a[href*='mnjuser/profile' i]",
+    "[class*='userName' i]",
+    "text=View & Update Profile",
+]
+
+USERNAME_SELECTORS = [
+    "input[placeholder*='Email ID' i]",
+    "input[placeholder*='Username' i]",
+    "#usernameField",
+    "#emailTxt",
+    "input[name='USERNAME']",
+]
+
+PASSWORD_SELECTORS = [
+    "input[placeholder*='Password' i]:not([placeholder*='OTP' i])",
+    "#passwordField",
+    "#pwd1",
+    "input[name='PASSWORD']",
+]
+
+
+async def _has_logged_in_ui(page) -> bool:
+    """Best-effort check for an authenticated Naukri session on the current page."""
+    if "mnjuser" in page.url.lower():
+        return True
+    for sel in LOGGED_IN_SELECTORS:
+        try:
+            if await page.locator(sel).first.is_visible(timeout=1500):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _fill_first_visible(page, selectors: list[str], value: str):
+    """Fill the first visible (or attached) input from candidates."""
+    sel = await wait_for_first_visible(page, selectors, timeout_ms=30000)
+    loc = page.locator(sel).first
+    try:
+        await loc.fill(value, timeout=10000)
+    except Exception:
+        # Naukri sometimes keeps the canonical field in DOM but hidden behind another layer.
+        await loc.fill(value, force=True, timeout=10000)
+    return sel
+
+
 async def login(page):
     # domcontentloaded avoids hanging on long-lived analytics requests (Naukri never reaches "networkidle").
     await page.goto(
@@ -163,38 +217,53 @@ async def login(page):
         wait_until="domcontentloaded",
         timeout=60000,
     )
+    await page.wait_for_timeout(1500)
+    await dismiss_overlays(page)
     logging.info("Login page: url=%r title=%r", page.url, await page.title())
 
-    # Naukri serves at least two login UIs (SPA vs login.naukri.com legacy). Waiting only for
-    # #usernameField times out when the legacy form (#emailTxt / #pwd1) is shown instead.
-    user = page.locator("#usernameField, #emailTxt, input[name='USERNAME']").first
-    await user.wait_for(state="visible", timeout=45000)
+    if await _has_logged_in_ui(page):
+        logging.info("Already logged in — login URL redirected or session became active.")
+        return
+
+    # Persistent profiles may finish hydrating cookies only after the SPA loads; accept either
+    # a visible login form or a redirect into mnjuser before filling credentials.
+    try:
+        await wait_for_any(
+            page,
+            urls=LOGGED_IN_URL_GLOBS,
+            selectors=USERNAME_SELECTORS + PASSWORD_SELECTORS,
+            timeout_ms=45000,
+        )
+    except Exception:
+        await dump_debug_artifacts(page, "login_form_wait")
+        raise
+
+    if await _has_logged_in_ui(page):
+        logging.info("Already logged in — redirect detected while waiting for login form.")
+        return
+
+    # Naukri serves at least two login UIs (SPA vs login.naukri.com legacy). `.first` on a
+    # combined selector can resolve to a hidden #usernameField while #emailTxt is the visible one.
+    used_user = await _fill_first_visible(page, USERNAME_SELECTORS, EMAIL)
+    logging.info("Filled username via %s", used_user)
 
     pwd_new = page.locator("#passwordField")
     if await pwd_new.is_visible():
-        await page.locator("#usernameField").fill(EMAIL)
         await pwd_new.fill(PASSWORD)
         await page.locator("button[type='submit']").first.click()
     else:
-        await page.locator("#emailTxt, input[name='USERNAME']").first.fill(EMAIL)
-        await page.locator("#pwd1").fill(PASSWORD)
-        await page.locator("#sbtLog[name='Login']").first.click()
+        used_pwd = await _fill_first_visible(page, [s for s in PASSWORD_SELECTORS if s != "#passwordField"], PASSWORD)
+        logging.info("Filled password via %s", used_pwd)
+        submit = page.locator("#sbtLog[name='Login'], button[type='submit']:has-text('Login')").first
+        await submit.click()
 
     # Naukri sometimes does not fire the full 'load' event (long-lived requests), so do not wait for it.
     # Also, the post-login landing URL can vary. Accept any mnjuser page or presence of a logged-in header.
     try:
         await wait_for_any(
             page,
-            urls=[
-                "**/mnjuser/homepage**",
-                "**/mnjuser/profile**",
-                "**/mnjuser/**",
-            ],
-            selectors=[
-                # Logged-in top navigation (best-effort; selector may vary)
-                "a[href*='logout' i]",
-                "a[href*='mnjuser/profile' i]",
-            ],
+            urls=LOGGED_IN_URL_GLOBS,
+            selectors=LOGGED_IN_SELECTORS,
             timeout_ms=60000,
         )
     except Exception:
@@ -215,13 +284,17 @@ async def login(page):
 
 async def _session_valid_on_profile(page) -> bool:
     """After navigating to /mnjuser/profile, detect whether we are logged in."""
-    if "nlogin" in page.url.lower():
+    if "nlogin" in page.url.lower() or page.url.rstrip("/").endswith("/login"):
         return False
-    try:
-        await page.wait_for_selector("text=Resume", timeout=15000)
+    if await _has_logged_in_ui(page):
         return True
-    except PlaywrightTimeoutError:
-        return False
+    for sel in ("text=Resume", "text=Update resume", "text=Resume headline"):
+        try:
+            await page.wait_for_selector(sel, timeout=10000)
+            return True
+        except PlaywrightTimeoutError:
+            continue
+    return False
 
 
 async def ensure_logged_in(page):
@@ -233,12 +306,31 @@ async def ensure_logged_in(page):
         wait_until="domcontentloaded",
         timeout=60000,
     )
+    # Persistent sessions sometimes redirect only after client-side hydration.
+    await page.wait_for_timeout(2000)
+    await dismiss_overlays(page)
+
     if await _session_valid_on_profile(page):
         logging.info("Existing Naukri session is still valid — skipping credential login.")
         return
+
+    # Profile probe can race with cookie restore; homepage is another reliable logged-in target.
+    await page.goto(
+        "https://www.naukri.com/mnjuser/homepage",
+        wait_until="domcontentloaded",
+        timeout=60000,
+    )
+    await page.wait_for_timeout(1500)
+    if await _has_logged_in_ui(page):
+        logging.info("Existing Naukri session is still valid — skipping credential login.")
+        return
+
     logging.info("No usable session — performing login.")
     await login(page)
-    await page.goto("https://www.naukri.com/mnjuser/profile", timeout=60000)
+
+    if not await _has_logged_in_ui(page):
+        await page.goto("https://www.naukri.com/mnjuser/profile", wait_until="domcontentloaded", timeout=60000)
+
     await page.wait_for_selector("text=Resume", timeout=20000)
 
 
