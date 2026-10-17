@@ -1,9 +1,11 @@
 import asyncio
+import atexit
+import logging
 import os
 import shutil
-import sys
 import smtplib
-import logging
+import sys
+import tempfile
 from datetime import datetime
 from email.message import EmailMessage
 
@@ -31,6 +33,74 @@ _DEFAULT_USER_DATA_DIR = os.path.join(_SCRIPT_DIR, ".pw-profile")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# Cron redirects stdout/stderr into cron.log. When that redirect is active, buffer the
+# whole run and append it only if the job fails, so successful runs leave cron.log unchanged.
+_RUN_FAILED = False
+_CAPTURED_LOG = None  # (temp_path, cron_log_path)
+
+
+def _cron_log_redirect_path():
+    """Path of stdout when cron (or a shell) already redirected it to cron.log."""
+    try:
+        path = os.readlink("/proc/self/fd/1")
+    except OSError:
+        return None
+    if os.path.basename(path) != "cron.log":
+        return None
+    return path
+
+
+def mark_run_failed():
+    global _RUN_FAILED
+    _RUN_FAILED = True
+
+
+def _flush_captured_log():
+    sys.stdout.flush()
+    sys.stderr.flush()
+    logging.shutdown()
+    if not _CAPTURED_LOG:
+        return
+    temp_path, cron_log_path = _CAPTURED_LOG
+    try:
+        if _RUN_FAILED:
+            with open(temp_path, "rb") as src:
+                data = src.read()
+            if not data:
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                data = f"{stamp} [ERROR] Run failed with no log output\n".encode()
+            elif not data.endswith(b"\n"):
+                data += b"\n"
+            with open(cron_log_path, "ab") as out:
+                out.write(data)
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def install_failure_only_cron_log():
+    """
+    Steal stdout/stderr (including Chromium) into a temp file when cron already
+    points them at cron.log. atexit appends that file only after a failed run.
+    """
+    global _CAPTURED_LOG
+    if os.getenv("CI", "false").lower() == "true":
+        return
+    if os.getenv("CRON_LOG_FAILURES_ONLY", "1").lower() in ("0", "false", "no"):
+        return
+    cron_log_path = _cron_log_redirect_path()
+    if not cron_log_path:
+        return
+
+    fd, temp_path = tempfile.mkstemp(prefix="naukri_run_", suffix=".log")
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+    _CAPTURED_LOG = (temp_path, cron_log_path)
+    atexit.register(_flush_captured_log)
+
 
 # ================== UTIL ==================
 
@@ -49,6 +119,7 @@ def validate_env():
     if missing:
         logging.error("Missing required environment variables: %s", ", ".join(missing))
         logging.error("In GitHub Actions, ensure these repository secrets are set and mapped in the workflow.")
+        mark_run_failed()
         sys.exit(2)
 
 
@@ -335,21 +406,81 @@ async def ensure_logged_in(page):
 
 
 async def dismiss_overlays(page):
-    """Close Naukri modals/toasts that can block profile edits."""
+    """Close Naukri modals that sit on top of profile actions.
+
+    The profile NPS survey (#ni-desktop-nps-profile / .md__backdrop) covers
+    "Update resume" and swallows the click. Escape and the older lightbox
+    close buttons do not dismiss it.
+    """
     try:
         await page.keyboard.press("Escape")
-        await page.wait_for_timeout(500)
-        for sel in (
-            ".ltLayer.open .crossIcon",
-            ".ltLayer.open [class*='close']",
-            "button[aria-label='Close']",
-        ):
-            btn = page.locator(sel).first
-            if await btn.is_visible():
-                await btn.click()
-                await page.wait_for_timeout(500)
+        await page.wait_for_timeout(300)
     except Exception:
         pass
+
+    for sel in (
+        "#ni-desktop-nps-profile img[alt='cross-icon']",
+        ".nps-feedback-container img[alt='cross-icon']",
+        "img[alt='cross-icon']",
+        ".ltLayer.open .crossIcon",
+        ".ltLayer.open [class*='close']",
+        "button[aria-label='Close']",
+        "[aria-label='Close']",
+    ):
+        try:
+            btn = page.locator(sel).first
+            if await btn.count() and await btn.is_visible():
+                await btn.click(timeout=2000, force=True)
+                await page.wait_for_timeout(300)
+        except Exception:
+            continue
+
+    try:
+        await page.evaluate(
+            """
+            () => {
+                const id = 'naukri-bot-hide-blocking-overlays';
+                if (!document.getElementById(id)) {
+                    const style = document.createElement('style');
+                    style.id = id;
+                    style.textContent = `
+                        #ni-desktop-nps-profile,
+                        .nps-feedback-container,
+                        .md__backdrop {
+                            display: none !important;
+                            pointer-events: none !important;
+                        }
+                    `;
+                    document.documentElement.appendChild(style);
+                }
+                document.querySelectorAll(
+                    '#ni-desktop-nps-profile, .nps-feedback-container'
+                ).forEach((el) => el.remove());
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+async def click_update_resume(page):
+    """Click the resume upload button after clearing the NPS survey overlay."""
+    button = page.locator(
+        "input.dummyUpload[value='Update resume'], input[type='button'][value='Update resume']"
+    ).first
+    await button.wait_for(state="visible", timeout=20000)
+    await dismiss_overlays(page)
+    try:
+        await button.click(timeout=8000)
+    except Exception as first_err:
+        logging.info("Update resume click blocked (%s); dismissing overlays and retrying", first_err)
+        await dismiss_overlays(page)
+        try:
+            await button.click(timeout=8000)
+        except Exception:
+            await dismiss_overlays(page)
+            await button.evaluate("node => node.click()")
+    logging.info("Clicked Update resume")
 
 
 async def wait_for_first_visible(page, selectors: list[str], *, timeout_ms: int) -> str:
@@ -530,8 +661,9 @@ async def upload_resume_once(resume_path):
         try:
             await ensure_logged_in(page)
 
-            # Upload resume
-            await page.click("text=Update resume")
+            # Upload resume. A profile NPS survey mounts over this button and
+            # intercepts pointer events until it is closed.
+            await click_update_resume(page)
             await page.set_input_files("input[type='file']", resume_path)
 
             await page.wait_for_timeout(5000)
@@ -588,9 +720,21 @@ async def upload_with_retry():
         f"Update Failed - {today}",
         f"Resume/Profile update failed after {MAX_RETRIES} attempts."
     )
+    mark_run_failed()
     sys.exit(1)
 
 
 if __name__ == "__main__":
-    validate_env()
-    asyncio.run(upload_with_retry())
+    install_failure_only_cron_log()
+    try:
+        validate_env()
+        asyncio.run(upload_with_retry())
+    except SystemExit as exc:
+        if exc.code not in (0, None):
+            mark_run_failed()
+        raise
+    except Exception:
+        mark_run_failed()
+        logging.exception("Unhandled error")
+        raise
+
